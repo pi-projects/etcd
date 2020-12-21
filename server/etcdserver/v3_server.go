@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
-	"fmt"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"strconv"
 	"time"
