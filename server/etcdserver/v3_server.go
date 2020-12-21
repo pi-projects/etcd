@@ -19,6 +19,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	"strconv"
 	"time"
 
@@ -128,7 +130,63 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
 		err = serr
 		return nil, err
 	}
+	if resp.GetCount() > 0 {
+		for ki, kv := range resp.GetKvs() {
+			maxV, err := strconv.ParseUint(string((kv.Value)), 10, 0)
+			if err != nil {
+				return nil, err
+			}
+			item, ok := s.lcs[string(kv.Key)]
+			if !ok {
+				item, err = s.setNewLCS(ctx, kv, maxV)
+			}
+			currentS, err := item.Next()
+			if err != nil {
+				if err.Error() == "over max" {
+					go s.updateLCSMax(ctx, kv, item)
+				}
+				return resp, err
+			}
+			resp.Kvs[ki].Value = []byte(strconv.FormatUint(currentS, 10))
+			if (item.max - currentS) * 10 > (s.lcsBatch) {
+				go s.updateLCSMax(ctx, kv, item)
+			}
+		}
+	}
 	return resp, err
+}
+
+func (s *EtcdServer) updateLCSMax(ctx context.Context, kv *mvccpb.KeyValue, lcs *LCS) (error) {
+	lcs.maxLock.Lock()
+	defer lcs.maxLock.Unlock()
+	r := &pb.PutRequest{}
+	r.Key = kv.Key
+	max := lcs.max + s.lcsBatch
+	r.Value = []byte(strconv.FormatUint(max, 10))
+	ctx = context.WithValue(ctx, traceutil.StartTimeKey, time.Now())
+	_, err := s.raftRequest(ctx, pb.InternalRaftRequest{Put: r})
+	if err != nil {
+		return err
+	}
+	lcs.UpdateMax(max)
+	return nil
+}
+
+func (s *EtcdServer) setNewLCS(ctx context.Context, kv *mvccpb.KeyValue, prevMax uint64) (*LCS, error) {
+	s.lcsMapLock.Lock()
+	r := &pb.PutRequest{}
+	r.Key = kv.Key
+	max := prevMax + s.lcsBatch
+	r.Value = []byte(strconv.FormatUint(max, 10))
+	ctx = context.WithValue(ctx, traceutil.StartTimeKey, time.Now())
+	_, err := s.raftRequest(ctx, pb.InternalRaftRequest{Put: r})
+	if err != nil {
+		return nil, err
+	}
+	defer s.lcsMapLock.Unlock()
+	item := NewLCS(max, prevMax)
+	s.lcs[string(kv.Key)] = item
+	return item, err
 }
 
 func (s *EtcdServer) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error) {

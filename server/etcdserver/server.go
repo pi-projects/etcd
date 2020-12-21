@@ -17,6 +17,7 @@ package etcdserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"math"
@@ -206,6 +207,10 @@ type EtcdServer struct {
 	lg   *zap.Logger
 
 	w wait.Wait
+
+	lcs map[string]*LCS // lcs
+	lcsMapLock *sync.RWMutex
+	lcsBatch uint64
 
 	readMu sync.RWMutex
 	// read routine notifies etcd server that it waits for reading by sending an empty struct to
@@ -509,6 +514,9 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		forceVersionC:    make(chan struct{}),
 		AccessController: &AccessController{CORS: cfg.CORS, HostWhitelist: cfg.HostWhitelist},
 		consistIndex:     cindex.NewConsistentIndex(be.BatchTx()),
+		lcs: make(map[string]*LCS),
+		lcsMapLock: new(sync.RWMutex),
+		lcsBatch: 1000,
 	}
 	serverID.With(prometheus.Labels{"server_id": id.String()}).Set(1)
 
@@ -969,6 +977,9 @@ func (s *EtcdServer) run() {
 				s.leaderChanged = make(chan struct{})
 				close(lc)
 				s.leaderChangedMu.Unlock()
+				s.lcsMapLock.Lock()
+				defer s.lcsMapLock.Unlock()
+				s.lcs = make(map[string]*LCS)
 			}
 			// TODO: remove the nil checking
 			// current test utility does not provide the stats
@@ -2508,4 +2519,35 @@ func (s *EtcdServer) IsMemberExist(id types.ID) bool {
 // raftStatus returns the raft status of this etcd node.
 func (s *EtcdServer) raftStatus() raft.Status {
 	return s.r.Node.Status()
+}
+
+type LCS struct {
+	currentSequence uint64
+	max uint64
+	lock *sync.RWMutex
+	maxLock *sync.RWMutex
+}
+
+func NewLCS(maxV, v uint64) *LCS {
+	lcs := &LCS{}
+	lcs.currentSequence = v
+	lcs.max = maxV
+	lcs.lock = new(sync.RWMutex)
+	lcs.maxLock = new(sync.RWMutex)
+	return lcs
+}
+
+func (l *LCS) Next() (uint64, error) {
+	if l.currentSequence >= l.max{
+		return 0, errors.New("over max");
+	}
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	r := l.currentSequence + 1
+	l.currentSequence = r
+	return r, nil
+}
+
+func (l *LCS) UpdateMax(max uint64) {
+	l.max = max
 }
